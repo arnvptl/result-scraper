@@ -1,0 +1,29 @@
+name: Clear All Scraper Caches
+
+on:
+  workflow_dispatch:
+
+jobs:
+  clear:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete all scrape caches
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Fetching all caches..."
+          PAGE=1
+          TOTAL=0
+          while true; do
+            CACHES=$(gh api "/repos/${{ github.repository }}/actions/caches?per_page=100&page=$PAGE" --jq '.actions_caches[].id')
+            if [ -z "$CACHES" ]; then
+              break
+            fi
+            for ID in $CACHES; do
+              echo "Deleting cache $ID..."
+              gh api --method DELETE "/repos/${{ github.repository }}/actions/caches/$ID" || true
+              TOTAL=$((TOTAL + 1))
+            done
+            PAGE=$((PAGE + 1))
+          done
+          echo "✅ Deleted $TOTAL caches"
