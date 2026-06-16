@@ -8,17 +8,28 @@ on:
         default: '1'
         required: false
 
+# Prevent multiple runs from conflicting
+concurrency:
+  group: wit-scraper
+  cancel-in-progress: false
+
 jobs:
   # ──────────────────────────────────────────────
-  # Stage 1: Scrape — one job per year in parallel
+  # Stage 1: Scrape — one job per year×branch
   # ──────────────────────────────────────────────
   scrape:
     strategy:
       matrix:
         year: [22, 23, 24, 25]
-      fail-fast: false  # don't cancel other years if one fails
+        branch: [1, 2, 3, 4, 5, 6, 7]
+        exclude:
+          # Branch 7 (AI/ML) only exists for year 25
+          - { year: 22, branch: 7 }
+          - { year: 23, branch: 7 }
+          - { year: 24, branch: 7 }
+      fail-fast: false
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 330
 
     steps:
       - name: Checkout code
@@ -33,32 +44,58 @@ jobs:
         working-directory: actions
         run: go mod tidy
 
-      - name: Run scraper for year 20${{ matrix.year }}
+      # Restore cached results + checkpoint from previous runs
+      - name: Restore cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            actions/results_*.json
+            actions/failed_*.json
+            actions/checkpoint_*.json
+          key: scrape-${{ matrix.year }}-${{ matrix.branch }}-${{ github.run_id }}
+          restore-keys: |
+            scrape-${{ matrix.year }}-${{ matrix.branch }}-
+
+      - name: Run scraper (year 20${{ matrix.year }}, branch ${{ matrix.branch }})
         working-directory: actions
         run: go run scraper.go ${{ github.event.inputs.start_roll }}
         env:
           YEAR_FILTER: ${{ matrix.year }}
+          BRANCH_FILTER: ${{ matrix.branch }}
+
+      # Save cache for resume on next run
+      - name: Save cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            actions/results_*.json
+            actions/failed_*.json
+            actions/checkpoint_*.json
+          key: scrape-${{ matrix.year }}-${{ matrix.branch }}-${{ github.run_id }}
 
       - name: Copy results to workspace root
         if: always()
         run: |
           cp actions/results_*.json . 2>/dev/null || true
           cp actions/failed_*.json . 2>/dev/null || true
-          ls -la *.json 2>/dev/null || echo "No JSON files found"
+          cp actions/checkpoint_*.json . 2>/dev/null || true
+          ls -la *.json 2>/dev/null || echo "No JSON files produced"
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: results-${{ matrix.year }}
+          name: results-y${{ matrix.year }}-b${{ matrix.branch }}
           path: |
             results_*.json
             failed_*.json
+            checkpoint_*.json
           retention-days: 30
           if-no-files-found: warn
 
   # ──────────────────────────────────────────────
-  # Stage 2: Merge all per-year results
+  # Stage 2: Merge all per-job results
   # ──────────────────────────────────────────────
   merge:
     needs: scrape
@@ -143,3 +180,29 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_SERVER_URL: ${{ github.server_url }}
+
+  # ──────────────────────────────────────────────
+  # Stage 4: Auto-rerun if any scrape job failed
+  # ──────────────────────────────────────────────
+  rerun:
+    needs: [scrape, merge, notify]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check incomplete jobs and trigger rerun
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "⚠ Some jobs failed or timed out."
+          echo "Checking checkpoint files to see if resume is needed..."
+          
+          # Count how many scrape jobs failed
+          echo "Triggering re-run of failed jobs..."
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/rerun-failed-jobs"
+          
+          echo "✅ Re-run triggered. The scraper will resume from checkpoints."

@@ -450,6 +450,70 @@ func (w *bufferedFailWriter) count() int {
 	return len(w.failed)
 }
 
+// ────────────────────── CHECKPOINT ──────────────────────
+
+// Checkpoint tracks progress so the scraper can resume after timeout/failure.
+type Checkpoint struct {
+	Year      int  `json:"year"`
+	Branch    int  `json:"branch"`
+	DSY       int  `json:"dsy"`
+	LastRoll  int  `json:"lastRoll"`
+	Completed bool `json:"completed"`
+}
+
+func loadCheckpoint(path string) *Checkpoint {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var cp Checkpoint
+	if json.Unmarshal(raw, &cp) != nil {
+		return nil
+	}
+	return &cp
+}
+
+func saveCheckpoint(path string, cp *Checkpoint) {
+	f, err := os.Create(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "⚠ checkpoint save error: %v\n", err)
+		return
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	enc.Encode(cp)
+}
+
+// shouldSkip returns true if this (year, branch, dsy, roll) combination has
+// already been completed according to the checkpoint.
+func (cp *Checkpoint) shouldSkip(year, branch, dsy, roll int) bool {
+	if cp == nil {
+		return false
+	}
+	if cp.Completed {
+		return true
+	}
+	// Compare progress lexicographically: year → branch → dsy → roll
+	if year < cp.Year {
+		return true
+	}
+	if year == cp.Year {
+		if branch < cp.Branch {
+			return true
+		}
+		if branch == cp.Branch {
+			if dsy < cp.DSY {
+				return true
+			}
+			if dsy == cp.DSY && roll <= cp.LastRoll {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ────────────────────── MAIN ──────────────────────
 
 func main() {
@@ -479,28 +543,47 @@ func main() {
 		}
 	}
 
-	// Build per-year output file names
+	// Build per-job output file names (include branch if filtered)
 	yearTag := "all"
 	if len(years) == 1 {
 		yearTag = strconv.Itoa(years[0])
 	}
-	outputFile := fmt.Sprintf("results_%s.json", yearTag)
-	failedFile := fmt.Sprintf("failed_%s.json", yearTag)
+	fileTag := yearTag
+	if branchFilter > 0 {
+		fileTag = fmt.Sprintf("%s_b%d", yearTag, branchFilter)
+	}
+	outputFile := fmt.Sprintf("results_%s.json", fileTag)
+	failedFile := fmt.Sprintf("failed_%s.json", fileTag)
+	checkpointFile := fmt.Sprintf("checkpoint_%s.json", fileTag)
 
-	fmt.Printf("📁 Output: %s | Failed: %s\n", outputFile, failedFile)
+	fmt.Printf("📁 Output: %s | Failed: %s | Checkpoint: %s\n", outputFile, failedFile, checkpointFile)
+
+	// Load checkpoint for resume
+	checkpoint := loadCheckpoint(checkpointFile)
+	if checkpoint != nil && !checkpoint.Completed {
+		fmt.Printf("🔄 Resuming from checkpoint: Year=%d Branch=%d DSY=%d Roll=%d\n",
+			checkpoint.Year, checkpoint.Branch, checkpoint.DSY, checkpoint.LastRoll)
+	} else if checkpoint != nil && checkpoint.Completed {
+		fmt.Printf("✅ Already completed (checkpoint says done). Exiting.\n")
+		return
+	}
 
 	resultWriter := newBufferedResultWriter(outputFile)
 	failWriter := newBufferedFailWriter(failedFile)
 
-	// Graceful shutdown: flush on SIGINT/SIGTERM
+	// Current progress tracker (updated after each batch)
+	currentCP := &Checkpoint{}
+
+	// Graceful shutdown: flush + save checkpoint on SIGINT/SIGTERM
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Println("\n⚠ Interrupted! Flushing data...")
+		fmt.Println("\n⚠ Interrupted! Flushing data + saving checkpoint...")
 		resultWriter.flush()
 		failWriter.flush()
-		fmt.Printf("💾 Saved %d results, %d failed\n", resultWriter.count(), failWriter.count())
+		saveCheckpoint(checkpointFile, currentCP)
+		fmt.Printf("💾 Saved %d results, %d failed. Checkpoint saved.\n", resultWriter.count(), failWriter.count())
 		os.Exit(0)
 	}()
 
@@ -511,7 +594,6 @@ func main() {
 	for _, yy := range years {
 		branches := branchesForYear(yy)
 		if branchFilter > 0 {
-			// Check if the requested branch is valid for this year
 			valid := false
 			for _, b := range branches {
 				if b == branchFilter {
@@ -529,8 +611,22 @@ func main() {
 
 		for _, bb := range branches {
 			for _, dd := range dsyValues {
+				// Check if this entire (year, branch, dsy) combo is already done
+				if checkpoint != nil && checkpoint.shouldSkip(yy, bb, dd, maxRoll) {
+					fmt.Printf("  ⏩ Skipping 20%d | Branch %02d | DSY %d (already done)\n", yy, bb, dd)
+					continue
+				}
+
 				fmt.Printf("\n━━━ Scanning 20%d | Branch %02d | DSY %d ━━━\n", yy, bb, dd)
-				rollCursor, emptyBatchCount := startRoll, 0
+
+				// Determine starting roll: use checkpoint if resuming this exact combo
+				rollStart := startRoll
+				if checkpoint != nil && yy == checkpoint.Year && bb == checkpoint.Branch && dd == checkpoint.DSY {
+					rollStart = checkpoint.LastRoll + 1
+					fmt.Printf("  🔄 Resuming from roll %d\n", rollStart)
+				}
+
+				rollCursor, emptyBatchCount := rollStart, 0
 
 				for {
 					var batchWg sync.WaitGroup
@@ -567,6 +663,16 @@ func main() {
 					}
 					batchWg.Wait()
 
+					// Update checkpoint after each batch
+					currentCP.Year = yy
+					currentCP.Branch = bb
+					currentCP.DSY = dd
+					currentCP.LastRoll = rollCursor + batchSize - 1
+					if currentCP.LastRoll > maxRoll {
+						currentCP.LastRoll = maxRoll
+					}
+					saveCheckpoint(checkpointFile, currentCP)
+
 					if foundInBatch {
 						emptyBatchCount = 0
 					} else {
@@ -581,6 +687,10 @@ func main() {
 			}
 		}
 	}
+
+	// Mark as completed
+	currentCP.Completed = true
+	saveCheckpoint(checkpointFile, currentCP)
 
 	// Final flush
 	resultWriter.flush()
@@ -597,8 +707,8 @@ func main() {
 
 	// Write summary for GitHub Actions step summary
 	if summaryFile := os.Getenv("GITHUB_STEP_SUMMARY"); summaryFile != "" {
-		summary := fmt.Sprintf("## Scrape Results (Year %s)\n\n| Metric | Value |\n|---|---|\n| Students found | %d |\n| USNs failed | %d |\n| Duration | %s |\n",
-			yearTag, resultWriter.count(), failWriter.count(), elapsed.Round(time.Second))
+		summary := fmt.Sprintf("## Scrape Results (%s)\n\n| Metric | Value |\n|---|---|\n| Students found | %d |\n| USNs failed | %d |\n| Duration | %s |\n| Completed | ✅ |\n",
+			fileTag, resultWriter.count(), failWriter.count(), elapsed.Round(time.Second))
 		os.WriteFile(summaryFile, []byte(summary), 0644)
 	}
 }
