@@ -119,6 +119,7 @@ func fetchExamPage(usn string, examID int) (*goquery.Document, error) {
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
+			fmt.Printf("  ↻ %s examID=%d retry #%d\n", usn, examID, attempt)
 			backoffSleep(attempt - 1)
 		}
 
@@ -268,6 +269,7 @@ func fetchAllSemesters(usn string) *StudentResult {
 	consecFails := 0
 	foundAny := false
 
+	fmt.Printf("🔍 %s\n", usn)
 	for eid := maxExamID; eid >= 1; eid-- {
 		doc, err := fetchExamPage(usn, eid)
 		if err != nil {
