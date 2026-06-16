@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/http/cookiejar"
@@ -24,21 +26,31 @@ import (
 const (
 	baseURL        = "https://witresults.contineo.in:7074"
 	constCC        = 11
-	requestTimeout = 12 * time.Second
-	maxConcurrency = 30  // GH Actions can handle more network I/O
-	batchSize      = 20  // larger batches = less loop overhead
+	requestTimeout = 15 * time.Second
+	maxConcurrency = 3    // gentle on shared hosting — 25 jobs × 3 = 75 total concurrent reqs
+	batchSize      = 5    // small batches → frequent progress logs
 	maxExamID      = 12
 	dummyCaptcha   = "xxxxx"
-	maxConsecFail  = 3   // stop descending exam IDs after this many consecutive failures
-	emptyBatchCut  = 5   // skip to next branch/dsy after this many consecutive empty batches
-	maxRoll        = 350 // upper bound on roll numbers
-	flushInterval  = 25  // flush to disk every N results
-	maxRetries     = 3   // HTTP retries per exam-ID fetch
+	maxConsecFail  = 3    // stop descending exam IDs after this many consecutive failures
+	emptyBatchCut  = 5    // skip to next branch/dsy after this many consecutive empty batches
+	maxRoll        = 350  // upper bound on roll numbers
+	flushInterval  = 25   // flush to disk every N results
+	maxRetries     = 4    // HTTP retries per exam-ID fetch
+	serverErrSleep = 30 * time.Second // wait when MySQL is down before retrying
 )
 
 var (
 	defaultYears = []int{22, 23, 24, 25}
 	dsyValues    = []int{1, 2}
+
+	// errServerDown is returned when the site's MySQL is down (detectable from response body).
+	// These are retriable server-side errors, NOT permanent "no data" failures.
+	errServerDown = fmt.Errorf("server MySQL error")
+
+	// Global counters updated atomically across all goroutines.
+	globalFound      int64
+	globalEmpty      int64
+	globalServerErrs int64
 )
 
 // branchesForYear returns the valid branches for a given admission year.
@@ -114,13 +126,21 @@ func backoffSleep(attempt int) {
 }
 
 // fetchExamPage performs the 3-step handshake for a specific exam ID with retries.
+// It buffers the response body so it can detect server-side MySQL errors before parsing.
+// MySQL errors are retried with a long sleep; network errors use exponential backoff.
 func fetchExamPage(usn string, examID int) (*goquery.Document, error) {
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
-			fmt.Printf("  ↻ %s examID=%d retry #%d\n", usn, examID, attempt)
-			backoffSleep(attempt - 1)
+			if lastErr == errServerDown {
+				fmt.Printf("  ⚠ %s examID=%d — MySQL down, waiting %s before retry #%d\n",
+					usn, examID, serverErrSleep, attempt)
+				time.Sleep(serverErrSleep)
+			} else {
+				fmt.Printf("  ↻ %s examID=%d — net error, retry #%d\n", usn, examID, attempt)
+				backoffSleep(attempt - 1)
+			}
 		}
 
 		jar, _ := cookiejar.New(nil)
@@ -157,9 +177,27 @@ func fetchExamPage(usn string, examID int) (*goquery.Document, error) {
 			lastErr = err
 			continue
 		}
-		defer r3.Body.Close()
 
-		doc, err := goquery.NewDocumentFromReader(r3.Body)
+		// Buffer body so we can inspect it before handing to the HTML parser.
+		bodyBytes, err := io.ReadAll(r3.Body)
+		r3.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Detect server-side MySQL errors — these look like valid HTTP 200 responses
+		// but contain an error message instead of student data.
+		body := string(bodyBytes)
+		if strings.Contains(body, "Database connection error") ||
+			strings.Contains(body, "Could not connect to MySQL") ||
+			strings.Contains(body, "mysql_connect") {
+			atomic.AddInt64(&globalServerErrs, 1)
+			lastErr = errServerDown
+			continue
+		}
+
+		doc, err := goquery.NewDocumentFromReader(bytes.NewReader(bodyBytes))
 		if err != nil {
 			lastErr = err
 			continue
@@ -646,24 +684,41 @@ func main() {
 						sem <- struct{}{} // acquire slot
 
 						go func(u string) {
-							defer batchWg.Done()
-							defer func() { <-sem }() // release slot
+						defer batchWg.Done()
+						defer func() { <-sem }() // release slot
 
-							atomic.AddInt64(&totalScanned, 1)
-							res := fetchAllSemesters(u)
+						atomic.AddInt64(&totalScanned, 1)
+						fmt.Printf("⏳ %s\n", u)
+						res := fetchAllSemesters(u)
 
-							if res != nil && len(res.Semesters) > 0 {
-								mu.Lock()
-								foundInBatch = true
-								mu.Unlock()
-								resultWriter.add(*res)
-								fmt.Printf("✔ %s — %s — %d sem(s)\n", u, res.Name, len(res.Semesters))
-							} else {
-								failWriter.add(u)
-							}
-						}(usn)
+						if res != nil && len(res.Semesters) > 0 {
+							mu.Lock()
+							foundInBatch = true
+							mu.Unlock()
+							resultWriter.add(*res)
+							atomic.AddInt64(&globalFound, 1)
+							fmt.Printf("✔ %s — %s — %d sem(s)\n", u, res.Name, len(res.Semesters))
+						} else {
+							failWriter.add(u)
+							atomic.AddInt64(&globalEmpty, 1)
+							fmt.Printf("✗ %s — no results\n", u)
+						}
+					}(usn)
 					}
 					batchWg.Wait()
+
+					// Batch progress summary — visible in GitHub Actions logs
+					batchEnd := rollCursor + batchSize - 1
+					if batchEnd > maxRoll {
+						batchEnd = maxRoll
+					}
+					fmt.Printf("  📊 [20%d|B%02d|D%d] rolls %03d–%03d | ✔ found: %d | ✗ empty: %d | ⚠ srv-err: %d | ⏱ %s\n",
+						yy, bb, dd, rollCursor, batchEnd,
+						atomic.LoadInt64(&globalFound),
+						atomic.LoadInt64(&globalEmpty),
+						atomic.LoadInt64(&globalServerErrs),
+						time.Since(startTime).Round(time.Second),
+					)
 
 					// Update checkpoint after each batch
 					currentCP.Year = yy
@@ -699,18 +754,21 @@ func main() {
 	failWriter.flush()
 
 	elapsed := time.Since(startTime)
+	srvErrs := atomic.LoadInt64(&globalServerErrs)
 	fmt.Print("\n\n" + strings.Repeat("━", 50) + "\n")
 	fmt.Printf("✅ DONE\n")
-	fmt.Printf("   Students found : %d\n", resultWriter.count())
-	fmt.Printf("   USNs failed    : %d\n", failWriter.count())
-	fmt.Printf("   Total time     : %s\n", elapsed.Round(time.Second))
-	fmt.Printf("   Avg per USN    : %.1fms\n", float64(elapsed.Milliseconds())/float64(max(totalScanned, 1)))
+	fmt.Printf("   Students found  : %d\n", resultWriter.count())
+	fmt.Printf("   USNs no results : %d\n", failWriter.count())
+	fmt.Printf("   Server errors   : %d\n", srvErrs)
+	fmt.Printf("   Total scanned   : %d\n", totalScanned)
+	fmt.Printf("   Total time      : %s\n", elapsed.Round(time.Second))
+	fmt.Printf("   Avg per USN     : %.1fms\n", float64(elapsed.Milliseconds())/float64(max(totalScanned, 1)))
 	fmt.Print(strings.Repeat("━", 50) + "\n")
 
 	// Write summary for GitHub Actions step summary
 	if summaryFile := os.Getenv("GITHUB_STEP_SUMMARY"); summaryFile != "" {
-		summary := fmt.Sprintf("## Scrape Results (%s)\n\n| Metric | Value |\n|---|---|\n| Students found | %d |\n| USNs failed | %d |\n| Duration | %s |\n| Completed | ✅ |\n",
-			fileTag, resultWriter.count(), failWriter.count(), elapsed.Round(time.Second))
+		summary := fmt.Sprintf("## Scrape Results (%s)\n\n| Metric | Value |\n|---|---|\n| Students found | %d |\n| USNs no results | %d |\n| Server errors (retried) | %d |\n| Duration | %s |\n| Completed | ✅ |\n",
+			fileTag, resultWriter.count(), failWriter.count(), srvErrs, elapsed.Round(time.Second))
 		os.WriteFile(summaryFile, []byte(summary), 0644)
 	}
 }
